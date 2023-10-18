@@ -3,51 +3,66 @@ package dbmigrate
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"os"
 	"sort"
 	"strconv"
 )
 
 type Config struct {
-	DB            *sql.DB
-	ScriptsFolder string
-	SchemaName    string
-	Migrations    []*Migration
+	Database       *sql.DB
+	DatabaseSchema string
+	ScriptsFolder  string
+	Migrations     []Migration
+	Log            *slog.Logger
 }
 
 type Migration struct {
-	Version int
-	SQL     string
+	Version      int
+	SQLStatement string
 }
 
-const versionTableName = "__dbmigrateinfo"
+const migrationInfoTableName = "__dbmigrateinfo"
 
-func Migrate(cfg *Config) (err error) {
+func Migrate(cfg Config) (err error) {
 	if len(cfg.Migrations) == 0 {
-		cfg.Migrations, err = loadMigrationFiles(cfg.ScriptsFolder)
+		cfg.Migrations, err = loadMigrationFilesFromDir(cfg.ScriptsFolder)
 		if err != nil {
 			return err
 		}
 	}
 
-	err = createMigrationTable(cfg.DB)
+	if err = createMigrationTable(cfg.Database); err != nil {
+		return err
+	}
+
+	tx, err := startTransaction(cfg.Database)
 	if err != nil {
 		return err
 	}
 
-	err = lockTable(cfg.DB)
-	if err != nil {
-		return err
+	if err = applyMigrations(tx, cfg.DatabaseSchema, cfg.Migrations); err != nil {
+		return RollbackOnError(tx, err)
 	}
-
-	defer unlockTable(cfg.DB, &err)
-
-	err = applyMigrations(cfg.DB, cfg.SchemaName, cfg.Migrations)
-	return err
+	return tx.Commit()
 }
 
-func applyMigrations(db *sql.DB, schema string, migrations []*Migration) error {
-	dbVersion, err := getVersion(db, schema)
+func startTransaction(db *sql.DB) (*sql.Tx, error) {
+	return db.Begin()
+}
+
+func RollbackOnError(tx *sql.Tx, err error) error {
+	if err != nil {
+		if innerErr := tx.Rollback(); innerErr != nil {
+			return err
+		}
+		return err
+	}
+	return nil
+}
+
+func applyMigrations(tx *sql.Tx, schema string, migrations []Migration) error {
+	dbVersion, err := getVersion(tx, schema)
 	if err != nil {
 		return err
 	}
@@ -61,12 +76,12 @@ func applyMigrations(db *sql.DB, schema string, migrations []*Migration) error {
 			continue
 		}
 
-		err = applyMigration(db, schema, m)
+		err = applyMigration(tx, m)
 		if err != nil {
 			return err
 		}
 
-		err = setVersion(db, schema, m.Version)
+		err = setVersion(tx, schema, m.Version)
 		if err != nil {
 			return err
 		}
@@ -75,18 +90,18 @@ func applyMigrations(db *sql.DB, schema string, migrations []*Migration) error {
 	return nil
 }
 
-func applyMigration(db *sql.DB, schema string, migration *Migration) error {
-	_, err := db.Exec(migration.SQL)
+func applyMigration(tx *sql.Tx, migration Migration) error {
+	_, err := tx.Exec(migration.SQLStatement)
 	return err
 }
 
-func loadMigrationFiles(folder string) ([]*Migration, error) {
-	files, err := os.ReadDir(folder)
+func loadMigrationFilesFromDir(dir string) ([]Migration, error) {
+	files, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
 
-	migrations := []*Migration{}
+	var migrations []Migration
 	for _, file := range files {
 		if file.IsDir() {
 			continue
@@ -94,17 +109,17 @@ func loadMigrationFiles(folder string) ([]*Migration, error) {
 
 		version, err := extractVersionFromFilename(file.Name())
 		if err != nil {
-			return nil, fmt.Errorf("invalid file in migrations folder, does not start with a number: '%s'", file.Name())
+			return nil, fmt.Errorf("invalid file in migrations dir, does not start with a number: '%s'", file.Name())
 		}
 
-		data, err := os.ReadFile(folder + "/" + file.Name())
+		sqlStatement, err := os.ReadFile(dir + "/" + file.Name())
 		if err != nil {
 			return nil, fmt.Errorf("failed to read file '%s': %s", file.Name(), err.Error())
 		}
 
-		migrations = append(migrations, &Migration{
-			Version: int(version),
-			SQL:     string(data),
+		migrations = append(migrations, Migration{
+			Version:      version,
+			SQLStatement: string(sqlStatement),
 		})
 	}
 
@@ -112,45 +127,25 @@ func loadMigrationFiles(folder string) ([]*Migration, error) {
 }
 
 func createMigrationTable(db *sql.DB) error {
-	sql := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" (
+	q := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" (
 		"schema" VARCHAR(100) PRIMARY KEY,
 		"version" int NOT NULL
-	)`, versionTableName)
-	_, err := db.Exec(sql)
+	)`, migrationInfoTableName)
+	_, err := db.Exec(q)
 	return err
 }
 
-func lockTable(db *sql.DB) error {
-	_, err := db.Exec("BEGIN")
-	if err != nil {
-		return err
-	}
-
-	_, err = db.Exec(fmt.Sprintf(`LOCK TABLE "%s" IN ACCESS EXCLUSIVE MODE NOWAIT`, versionTableName))
-	return err
-}
-
-func unlockTable(db *sql.DB, lastErr *error) error {
-	sql := "COMMIT"
-	if lastErr != nil && *lastErr != nil {
-		sql = "ROLLBACK"
-	}
-
-	_, err := db.Exec(sql)
-	return err
-}
-
-func getVersion(db *sql.DB, name string) (int, error) {
-	sql := fmt.Sprintf(`SELECT "version" FROM "%s" WHERE "schema" = $1`, versionTableName)
-	row := db.QueryRow(sql, name)
+func getVersion(tx *sql.Tx, name string) (int, error) {
+	q := fmt.Sprintf(`SELECT "version" FROM "%s" WHERE "schema" = $1`, migrationInfoTableName)
+	row := tx.QueryRow(q, name)
 	if row.Err() != nil {
 		return 0, row.Err()
 	}
 	version := -1
 	err := row.Scan(&version)
 	if err != nil {
-		sql = fmt.Sprintf(`INSERT INTO "%s" ("schema", "version") VALUES ($1, $2)`, versionTableName)
-		_, err = db.Exec(sql, name, version)
+		q = fmt.Sprintf(`INSERT INTO "%s" ("schema", "version") VALUES ($1, $2)`, migrationInfoTableName)
+		_, err = tx.Exec(q, name, version)
 		if err != nil {
 			return 0, err
 		}
@@ -158,9 +153,9 @@ func getVersion(db *sql.DB, name string) (int, error) {
 	return version, nil
 }
 
-func setVersion(db *sql.DB, name string, version int) error {
-	sql := fmt.Sprintf(`UPDATE "%s" SET "version" = %d WHERE "schema" = $1`, versionTableName, version)
-	_, err := db.Exec(sql, name)
+func setVersion(tx *sql.Tx, name string, version int) error {
+	q := fmt.Sprintf(`UPDATE "%s" SET "version" = %d WHERE "schema" = $1`, migrationInfoTableName, version)
+	_, err := tx.Exec(q, name)
 	return err
 }
 
