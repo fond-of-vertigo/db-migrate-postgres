@@ -1,4 +1,4 @@
-module dbmigrate
+module github.com/fond-of-vertigo/db-migrate-postgres
 
 go 1.21
 
